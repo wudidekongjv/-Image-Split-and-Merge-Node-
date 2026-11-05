@@ -1,0 +1,14 @@
+{
+    "name": "infinite-canvas-image-split-merge-node",
+    "version": "0.1.0",
+    "private": false,
+    "type": "module",
+    "description": "可独立安装的 Infinite Canvas 图片拆分与合并节点插件",
+    "scripts": {
+        "build": "node build.mjs",
+        "typecheck": "node --check src/image-split-merge.js"
+    },
+    "devDependencies": {
+        "esbuild": "^0.25.0"
+    }
+}
