@@ -158,7 +158,8 @@ function gridRegions(width, height, cols, rows) {
 
 // ────────────────────────────────────────────────────────────
 // 合并：把多张图拼成网格，带分割线、图号、批注。
-// items: [{ src, caption }]，caption 可为空字符串。
+// items: [{ src, caption }]，caption 可为空字符串（可含 \n 换行）。
+// 字号可调；文字较多时按最大宽度自动换行，行距随字号自适应。
 // ────────────────────────────────────────────────────────────
 async function mergeGrid(items, opts) {
     const cols = opts.cols || 2;
@@ -167,7 +168,7 @@ async function mergeGrid(items, opts) {
     const showNumbers = opts.showNumbers !== false;
     const captionColor = opts.captionColor || "#ffffff";
     const captionBg = opts.captionBg || "rgba(0,0,0,0.55)";
-    const fontPx = opts.fontPx || 16;
+    const fontPx = Math.max(8, Number(opts.fontPx) || 16);
 
     // 先加载所有图片，取统一尺寸（用第一张的尺寸为准，其余等比缩放到同尺寸）。
     const loaded = [];
@@ -192,6 +193,10 @@ async function mergeGrid(items, opts) {
     context.fillStyle = lineColor;
     context.fillRect(0, 0, totalW, totalH);
 
+    const lineHeight = Math.round(fontPx * 1.35); // 行距随字号自适应
+    const padX = 8;
+    const padY = 5;
+
     loaded.forEach((item, index) => {
         const c = index % cols;
         const r = Math.floor(index / cols);
@@ -205,23 +210,60 @@ async function mergeGrid(items, opts) {
         const oy = dy + (cellH - h) / 2;
         context.drawImage(item.image, ox, oy, w, h);
 
-        // 图号 + 批注
-        if (showNumbers || item.caption) {
-            const label = `${index + 1}${item.caption ? " " + item.caption : ""}`;
-            context.font = `bold ${fontPx}px system-ui, sans-serif`;
-            const textWidth = context.measureText(label).width;
-            const padX = 6;
-            const padY = 3;
-            const bx = dx + 4;
-            const by = dy + 4;
-            const bh = fontPx + padY * 2;
-            const bw = textWidth + padX * 2;
-            context.fillStyle = captionBg;
-            context.fillRect(bx, by, bw, bh);
-            context.fillStyle = captionColor;
-            context.textBaseline = "top";
-            context.fillText(label, bx + padX, by + padY);
+        // 图号 + 批注（支持多行、按宽度自动换行）
+        const numberText = showNumbers ? String(index + 1) : "";
+        const captionText = item.caption ? String(item.caption).trim() : "";
+        if (!numberText && !captionText) return;
+
+        context.font = `bold ${fontPx}px system-ui, sans-serif`;
+
+        // 把「图号 + 批注」拆成可换行的行（图号单独一行或与首行批注拼接）。
+        const maxTextWidth = Math.max(60, cellW - padX * 2);
+        const rawLines = String(captionText || "").split("\n");
+        const lines = [];
+        if (numberText) {
+            // 图号放首行，后接首行批注（若有）。
+            if (rawLines.length && rawLines[0]) {
+                lines.push(`${numberText} ${rawLines[0]}`);
+                for (let i = 1; i < rawLines.length; i++) lines.push(rawLines[i]);
+            } else {
+                lines.push(numberText);
+                for (const l of rawLines) if (l) lines.push(l);
+            }
+        } else {
+            for (const l of rawLines) if (l) lines.push(l);
         }
+
+        // 按宽度自动换行。
+        const wrapped = [];
+        for (const line of lines) {
+            let current = "";
+            for (const ch of line) {
+                if (context.measureText(current + ch).width > maxTextWidth && current) {
+                    wrapped.push(current);
+                    current = ch;
+                } else {
+                    current += ch;
+                }
+            }
+            if (current) wrapped.push(current);
+        }
+        if (!wrapped.length) return;
+
+        const textBlockH = wrapped.length * lineHeight + padY * 2;
+        let maxLineW = 0;
+        for (const line of wrapped) maxLineW = Math.max(maxLineW, context.measureText(line).width);
+        const bw = Math.min(cellW - padX, maxLineW + padX * 2);
+        const bx = dx + 4;
+        const by = dy + 4;
+
+        context.fillStyle = captionBg;
+        context.fillRect(bx, by, bw, textBlockH);
+        context.fillStyle = captionColor;
+        context.textBaseline = "top";
+        wrapped.forEach((line, i) => {
+            context.fillText(line, bx + padX, by + padY + i * lineHeight);
+        });
     });
 
     return canvas.toDataURL("image/png");
@@ -247,7 +289,11 @@ function ImageSplitMergeContent({ ctx, React }) {
     const [lineColor, setLineColor] = React.useState("#ffffff");
     const [lineWidth, setLineWidth] = React.useState(2);
     const [showNumbers, setShowNumbers] = React.useState(true);
-    const [mergeCaptions, setMergeCaptions] = React.useState(""); // 每行一个批注，对应第 N 张图
+    const [fontPx, setFontPx] = React.useState(16);
+
+    // 合并图片列表（每项 { key, src, resolvedSrc, caption, name, width, height }）
+    const [mergeItems, setMergeItems] = React.useState([]);
+    const [focusItemKey, setFocusItemKey] = React.useState(null); // 当前放大编辑的图
 
     // 结果预览
     const [splitPreviews, setSplitPreviews] = React.useState([]); // 拆分结果
@@ -261,23 +307,35 @@ function ImageSplitMergeContent({ ctx, React }) {
     const canvasRef = React.useRef(null);
     const drawingRef = React.useRef(null); // 拖拽中 { startX, startY } 相对图片坐标
 
-    // 从上游自动识别图片源。
+    // 从上游自动识别图片源：第一张作为「拆分」源图，全部进入「合并」列表。
     React.useEffect(() => {
         const sources = buildImageSources(ctxRef.current);
         if (!sources.length) return;
         const first = sources[0];
         void (async () => {
             try {
-                const resolved = await resolveImageSource(first.src);
-                if (!resolved) throw new Error("图片源地址为空");
-                const { width, height } = await loadImage(resolved);
-                setImageSrc(first.src);
-                setResolvedSrc(resolved);
-                setImageName(first.name);
-                setImgMeta({ width, height });
-                setCustomBoxes([]);
-                setSplitPreviews([]);
-                setMergePreview(null);
+                // 解析所有上游图片。
+                const resolvedItems = [];
+                for (const s of sources) {
+                    const resolved = await resolveImageSource(s.src);
+                    if (!resolved) continue;
+                    const { width, height } = await loadImage(resolved);
+                    resolvedItems.push({ key: `up-${s.id}`, src: s.src, resolvedSrc: resolved, caption: "", name: s.name, width, height });
+                }
+                // 合并列表 = 上游图片（替换旧的上游项，保留本地导入项）。
+                setMergeItems((prev) => {
+                    const localItems = prev.filter((it) => it.key.startsWith("local-"));
+                    return [...resolvedItems, ...localItems];
+                });
+
+                // 拆分源图用第一张上游。
+                const f = resolvedItems[0];
+                if (f) {
+                    setImageSrc(f.src);
+                    setResolvedSrc(f.resolvedSrc);
+                    setImageName(f.name);
+                    setImgMeta({ width: f.width, height: f.height });
+                }
                 setStatus("");
             } catch (error) {
                 setStatus(`图片加载失败：${error instanceof Error ? error.message : String(error)}`);
@@ -292,6 +350,7 @@ function ImageSplitMergeContent({ ctx, React }) {
         void (async () => {
             try {
                 const { width, height } = await loadImage(url);
+                // 作为拆分源图。
                 setImageSrc(url);
                 setResolvedSrc(url);
                 setImageName(file.name || "导入图片");
@@ -299,11 +358,26 @@ function ImageSplitMergeContent({ ctx, React }) {
                 setCustomBoxes([]);
                 setSplitPreviews([]);
                 setMergePreview(null);
+                // 加入合并列表。
+                const item = { key: `local-${randomId("img")}`, src: url, resolvedSrc: url, caption: "", name: file.name || "导入图片", width, height };
+                setMergeItems((prev) => [...prev, item]);
                 setStatus("");
             } catch (error) {
                 setStatus(`图片加载失败：${error instanceof Error ? error.message : String(error)}`);
             }
         })();
+    };
+
+    // 删除合并列表中的一张图。
+    const removeMergeItem = (key) => {
+        setMergeItems((prev) => prev.filter((it) => it.key !== key));
+        if (focusItemKey === key) setFocusItemKey(null);
+        setMergePreview(null);
+    };
+
+    // 更新某张图的批注。
+    const updateMergeCaption = (key, caption) => {
+        setMergeItems((prev) => prev.map((it) => (it.key === key ? { ...it, caption } : it)));
     };
 
     // 拆分执行。
@@ -332,27 +406,14 @@ function ImageSplitMergeContent({ ctx, React }) {
         }
     };
 
-    // 合并执行：用上游所有图片 + 本地导入图片。
+    // 合并执行：用 mergeItems 列表里的所有图。
     const doMerge = async () => {
         setBusy(true);
         setStatus("");
         try {
-            const sources = buildImageSources(ctxRef.current);
-            const all = [...sources.map((s) => ({ src: s.src }))];
-            // 若当前 imageSrc 是本地导入的，也加入（避免和上游重复）。
-            if (resolvedSrc && !sources.some((s) => s.src === imageSrc)) {
-                all.push({ src: imageSrc });
-            }
-            if (!all.length) { setStatus("没有可合并的图片（请连接上游图片或导入）"); setBusy(false); return; }
+            if (!mergeItems.length) { setStatus("没有可合并的图片（请连接上游图片或导入）"); setBusy(false); return; }
 
-            const resolvedList = [];
-            for (const item of all) {
-                resolvedList.push({ src: await resolveImageSource(item.src), caption: "" });
-            }
-
-            // 解析批注（每行一个）。
-            const captions = String(mergeCaptions || "").split(/\r?\n/).map((s) => s.trim());
-            resolvedList.forEach((item, i) => { item.caption = captions[i] || ""; });
+            const resolvedList = mergeItems.map((it) => ({ src: it.resolvedSrc || it.src, caption: it.caption || "" }));
 
             const cols = Math.max(1, Number(mergeCols) || 1);
             const dataUrl = await mergeGrid(resolvedList, {
@@ -362,7 +423,7 @@ function ImageSplitMergeContent({ ctx, React }) {
                 showNumbers,
                 captionColor: "#ffffff",
                 captionBg: "rgba(0,0,0,0.55)",
-                fontPx: 16,
+                fontPx: Number(fontPx) || 16,
             });
             setMergePreview({ key: randomId("merge"), dataUrl, fileName: "拼接图.png" });
             setSplitPreviews([]);
@@ -597,15 +658,61 @@ function ImageSplitMergeContent({ ctx, React }) {
                 h("div", { style: labelStyle }, "分割线颜色"),
                 h("input", { type: "color", value: lineColor, style: { ...inputStyle, height: 28, padding: 0 }, onChange: (e) => setLineColor(e.target.value) }),
             ),
+            h("div", { style: { flex: 1 } },
+                h("div", { style: labelStyle }, "标注字号(px)"),
+                h("input", { type: "number", min: 8, max: 64, value: fontPx, style: inputStyle, onChange: (e) => setFontPx(Number(e.target.value)) }),
+            ),
             h("label", { style: { flex: 1, display: "flex", alignItems: "center", gap: 6, fontSize: 12 } },
                 h("input", { type: "checkbox", checked: showNumbers, onChange: (e) => setShowNumbers(e.target.checked) }),
                 "标注图号",
             ),
         ),
+        // 合并图片列表：缩略图 + 序号 + 悬停删除。
         h("div", null,
-            h("div", { style: labelStyle }, "每张图批注（每行一个，按拼接顺序对应）"),
-            h("textarea", { value: mergeCaptions, rows: 3, style: { ...inputStyle, resize: "vertical" }, placeholder: "第1张批注\n第2张批注\n…", onChange: (e) => setMergeCaptions(e.target.value) }),
+            h("div", { style: labelStyle }, `合并图片（${mergeItems.length} 张，单击编辑批注，悬停右上角删除）`),
+            mergeItems.length
+                ? h("div", { style: { display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(76px, 1fr))", gap: 6 } },
+                    mergeItems.map((item, index) => {
+                        const isFocus = focusItemKey === item.key;
+                        return h("div", {
+                            key: item.key,
+                            style: { position: "relative", cursor: "pointer", borderRadius: 6, overflow: "hidden", border: isFocus ? `2px solid ${ctx.theme.accent || "#4c8dff"}` : "1px solid transparent", background: "#000" },
+                            onClick: () => setFocusItemKey(isFocus ? null : item.key),
+                        },
+                            h("img", { src: item.resolvedSrc || item.src, alt: item.name, style: { width: "100%", aspectRatio: "1/1", objectFit: "cover", display: "block" } }),
+                            // 左下序号
+                            h("div", { style: { position: "absolute", left: 4, bottom: 4, minWidth: 18, height: 18, padding: "0 4px", background: "rgba(0,0,0,0.6)", color: "#fff", fontSize: 11, fontWeight: 600, display: "flex", alignItems: "center", justifyContent: "center", borderRadius: 4 } }, String(index + 1)),
+                            // 右上删除按钮（悬停显示）
+                            h("div", {
+                                style: { position: "absolute", right: 3, top: 3, width: 18, height: 18, background: "rgba(0,0,0,0.6)", color: "#fff", fontSize: 13, lineHeight: "18px", textAlign: "center", borderRadius: "50%", cursor: "pointer", opacity: 0, transition: "opacity 0.15s" },
+                                title: "删除此图",
+                                onMouseEnter: (e) => { e.currentTarget.style.opacity = 1; },
+                                onMouseLeave: (e) => { e.currentTarget.style.opacity = 0; },
+                                onClick: (e) => { e.stopPropagation(); removeMergeItem(item.key); },
+                            }, "×"),
+                            // 有批注时左下角上方显示一个小标记
+                            item.caption ? h("div", { style: { position: "absolute", right: 3, bottom: 3, fontSize: 10, color: "#fff", background: "rgba(76,141,255,0.8)", padding: "0 4px", borderRadius: 3 } }, "批") : null,
+                        );
+                    }),
+                )
+                : h("div", { style: { fontSize: 11, color: muted } }, "请连接上游图片或导入图片"),
         ),
+        // 单击图片后的放大预览 + 批注编辑。
+        focusItemKey
+            ? (() => {
+                const focusItem = mergeItems.find((it) => it.key === focusItemKey);
+                if (!focusItem) return null;
+                return h("div", { style: { border: `1px solid ${stroke}`, borderRadius: 8, padding: 8, background: ctx.theme.toolbar.panel || "transparent" } },
+                    h("div", { style: { display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 6 } },
+                        h("div", { style: { fontSize: 11, color: muted, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" } }, `第 ${mergeItems.findIndex((it) => it.key === focusItemKey) + 1} 张 · ${focusItem.name}`),
+                        h("button", { type: "button", style: { ...buttonStyle, padding: "2px 8px", fontSize: 11 }, onClick: () => setFocusItemKey(null) }, "收起"),
+                    ),
+                    h("img", { src: focusItem.resolvedSrc || focusItem.src, alt: focusItem.name, style: { width: "100%", maxHeight: 200, objectFit: "contain", borderRadius: 6, display: "block", background: "#000" } }),
+                    h("div", { style: { ...labelStyle, marginTop: 8 } }, "批注（可多行，合并时自动换行）"),
+                    h("textarea", { value: focusItem.caption || "", rows: 3, style: { ...inputStyle, resize: "vertical" }, placeholder: "输入此图的批注…", onChange: (e) => updateMergeCaption(focusItemKey, e.target.value) }),
+                );
+            })()
+            : null,
         h("button", { type: "button", style: primaryStyle, onClick: doMerge, disabled: busy }, busy ? "处理中…" : "执行合并"),
         mergePreview
             ? h("div", null,
@@ -622,7 +729,7 @@ export default function createImageSplitMergePlugin(runtime) {
     return {
         id: "image-split-merge",
         name: "图片拆分与合并",
-        version: "0.1.0",
+        version: "0.2.0",
         minAppVersion: "0.12.0",
         description: "把图片拆分成多块（网格均分/自定义图框），或把多张图片拼接成带分割线、图号、批注的网格图。",
         nodes: [
