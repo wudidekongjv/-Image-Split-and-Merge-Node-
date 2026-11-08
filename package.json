@@ -6,7 +6,8 @@
     "description": "可独立安装的 Infinite Canvas 图片拆分与合并节点插件",
     "scripts": {
         "build": "node build.mjs",
-        "typecheck": "node --check src/image-split-merge.js"
+        "typecheck": "node --check src/image-split-merge.js",
+        "test": "node test-upstream.mjs && node test-editor.mjs"
     },
     "devDependencies": {
         "esbuild": "^0.25.0"

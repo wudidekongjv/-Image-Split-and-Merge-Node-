@@ -1,72 +1,249 @@
+import { openNativeAnnotateEditor } from "./annotate-editor.js";
+
 // Infinite Canvas 图片拆分与合并节点插件 —— 独立安装，不依赖宿主源码或 React 包。
 // 只使用 Infinite Canvas 公开的工厂运行时契约（runtime.React / ctx.*）。
 //
 // 功能：
 //   1) 拆分（切割）：网格均分（N×M）+ 自定义图框（预览图上鼠标拉矩形，可拉多个，按绘制顺序拆出）
 //   2) 合并（拼接）：网格拼接多张图，带分割线、自动标注图号、图号后可加批注
-// 图片来源：上游图片节点 + 本地导入，都支持。
-// 图片地址可能是 dataURL / blob / https://canvas-assets/xxx（走宿主 materialDataUrl 通道）。
+//   3) 标注 / 涂鸦：全屏编辑器，自由画笔、箭头、方框、橡皮、文字标注，导出原分辨率 PNG
+// 图片来源：普通图片节点 + 豆包等渠道生图节点 + 批量生成子节点 + 本地导入。
+// 图片地址可能是 dataURL / blob / 跨域外链 / https://canvas-assets/xxx（走宿主通道）。
 
 function randomId(prefix) {
     if (typeof crypto?.randomUUID === "function") return `${prefix}-${crypto.randomUUID()}`;
     return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
 }
 
-// 把图片源地址解析成「浏览器可加载」的地址（复刻宿主 hushifu-bridge 逻辑）。
-async function resolveImageSource(src) {
+// ────────────────────────────────────────────────────────────
+// 上游图片识别（通用适配层）
+//
+// 历史问题：旧实现只认 node.type === "image" | "panorama" 且
+// metadata.content 是字符串。豆包生图等宿主渠道节点是自定义类型、
+// 批量生成节点（batchChildIds）、或把地址放在别的字段里，于是整条
+// 上游被判为空。这里改成「字段白名单 + 结构展开 + 特征值兜底」。
+// ────────────────────────────────────────────────────────────
+
+// 宿主桥接对象在不同版本里名字不同，逐个尝试。
+function hostBridge() {
+    if (typeof window === "undefined") return null;
+    return window.hushifuHost || window.canvasHost || window.__CANVAS_HOST__ || window.storyaiHost || null;
+}
+
+// 一个字符串是否「看起来像图片地址」。
+function looksLikeImageUrl(value) {
+    if (typeof value !== "string") return false;
+    const v = value.trim();
+    // dataURL / blob 可能高达数 MB，必须先判定再检查长度，否则会被下面的上限误杀。
+    if (/^data:image\//i.test(v) || /^blob:/i.test(v)) return true;
+    if (/^https:\/\/canvas-assets\//i.test(v)) return true;
+    if (v.length < 8 || v.length > 20000) return false;
+    if (!/^https?:\/\//i.test(v)) return false;
+    if (/\.(png|jpe?g|webp|gif|bmp|avif|svg)(\?|#|$)/i.test(v)) return true;
+    // 豆包 / 字节系 CDN 的图片外链常无扩展名，但路径带明显图片语义。
+    if (/(byteimg|tos-|imagex|doubao|seedream|\/image\/|\/images\/|img[_-]?url|image_url)/i.test(v)) return true;
+    return false;
+}
+
+// 这些字段可能直接装图片地址（按优先级）。
+const IMAGE_FIELDS = [
+    "content", "dataUrl", "imageUrl", "imageURL", "url", "src", "coverUrl", "thumbUrl",
+    "downloadUrl", "download_url", "image", "output", "resultUrl", "result_url",
+];
+// 这些字段可能装「一组」图片地址或图片对象。
+const IMAGE_LIST_FIELDS = [
+    "images", "imageUrls", "image_urls", "urls", "results", "outputs", "items", "files", "data", "list",
+];
+// 文本类字段绝不当图片地址扫，避免把提示词里的链接误收。
+const SKIP_KEYS = new Set([
+    "prompt", "composerContent", "negativePrompt", "text", "title", "description",
+    "errorDetails", "panoramaSourcePrompt", "panoramaFinalPrompt", "contentText",
+]);
+
+// 从一个值里挖出所有图片地址字符串（带深度上限，避免递归爆炸）。
+function collectUrls(value, out, depth = 0) {
+    if (depth > 4 || out.length > 40) return;
+    if (typeof value === "string") {
+        if (looksLikeImageUrl(value)) out.push(value.trim());
+        return;
+    }
+    if (Array.isArray(value)) {
+        for (const item of value) collectUrls(item, out, depth + 1);
+        return;
+    }
+    if (!value || typeof value !== "object") return;
+    for (const [key, child] of Object.entries(value)) {
+        if (SKIP_KEYS.has(key)) continue;
+        collectUrls(child, out, depth + 1);
+    }
+}
+
+// 从单个节点里提取图片地址（返回去重后的数组）。
+function extractNodeUrls(node) {
+    const meta = node?.metadata || {};
+    const found = [];
+
+    // 1) 单值字段白名单
+    for (const field of IMAGE_FIELDS) {
+        const v = meta[field] ?? node?.[field];
+        if (typeof v === "string" && looksLikeImageUrl(v)) found.push(v.trim());
+    }
+    // 2) 列表字段
+    for (const field of IMAGE_LIST_FIELDS) {
+        const v = meta[field] ?? node?.[field];
+        if (v) collectUrls(v, found);
+    }
+    // 3) 兜底：mimeType 明确是图片时，浅扫整个 metadata
+    if (!found.length && /^image\//i.test(String(meta.mimeType || ""))) collectUrls(meta, found, 1);
+    // 4) 只有 storageKey 的情况：交给 resolveImageSource 走宿主通道
+    if (!found.length && typeof meta.storageKey === "string" && meta.storageKey) {
+        found.push(`canvas-storage://${meta.storageKey}`);
+    }
+
+    return [...new Set(found)];
+}
+
+// ctx.getUpstream() 在不同宿主版本里可能返回节点数组，或 {node, connection} 数组。
+function normalizeUpstream(raw) {
+    if (!raw) return [];
+    const list = Array.isArray(raw) ? raw : [raw];
+    return list.map((entry) => (entry && typeof entry === "object" && entry.node ? entry.node : entry)).filter(Boolean);
+}
+
+// 沿连接线向上多走几层，解决「豆包节点 → 中间节点 → 本节点」的间接上游。
+function expandUpstream(ctx, direct, maxDepth = 2) {
+    const allNodes = typeof ctx.getNodes === "function" ? ctx.getNodes() : [];
+    const connections = typeof ctx.getConnections === "function" ? ctx.getConnections() : [];
+    const byId = new Map(allNodes.map((n) => [n.id, n]));
+    const result = [];
+    const seen = new Set();
+
+    const visit = (node, sourceLabel) => {
+        if (!node || seen.has(node.id)) return;
+        seen.add(node.id);
+        result.push({ node, sourceLabel });
+        // 批量生成节点：把子节点一起纳入（豆包一次出多张的关键）。
+        const childIds = node.metadata?.batchChildIds;
+        if (Array.isArray(childIds)) {
+            for (const id of childIds) {
+                const child = byId.get(id);
+                if (child && !seen.has(child.id)) visit(child, `${sourceLabel} → 批量子图`);
+            }
+        }
+    };
+
+    let frontier = direct;
+    for (let depth = 0; depth <= maxDepth && frontier.length; depth++) {
+        const next = [];
+        for (const node of frontier) {
+            visit(node, depth === 0 ? "直接上游" : `间接上游 L${depth}`);
+            for (const conn of connections) {
+                if (conn.toNodeId !== node.id) continue;
+                const parent = byId.get(conn.fromNodeId);
+                if (parent && !seen.has(parent.id)) next.push(parent);
+            }
+        }
+        frontier = next;
+    }
+    return result;
+}
+
+// 汇总：返回 [{ id, src, name, storageKey, mimeType, sourceLabel }]
+function buildImageSources(ctx) {
+    const direct = normalizeUpstream(typeof ctx.getUpstream === "function" ? ctx.getUpstream() : []);
+    const entries = expandUpstream(ctx, direct, 2);
+    const sources = [];
+    const seenUrl = new Set();
+    for (const { node, sourceLabel } of entries) {
+        const urls = extractNodeUrls(node);
+        urls.forEach((src, index) => {
+            if (seenUrl.has(src)) return;
+            seenUrl.add(src);
+            sources.push({
+                id: `${node.id}::${index}`,
+                src,
+                name: node.title || "上游图片",
+                storageKey: node.metadata?.storageKey || "",
+                mimeType: node.metadata?.mimeType || "",
+                sourceLabel,
+                nodeType: node.type || "unknown",
+            });
+        });
+    }
+    return sources;
+}
+
+// 把图片源地址解析成「浏览器可加载」的地址。
+// 关键改动：远程地址 fetch 失败（跨域/CORS）不再直接抛错中断整批，
+// 而是退回原地址让 <img> 自行尝试；canvas-assets / storageKey 走宿主通道。
+async function resolveImageSource(src, storageKey) {
     const value = String(src || "");
     if (!value) return null;
     if (value.startsWith("data:") || value.startsWith("blob:")) return value;
 
-    const host = (typeof window !== "undefined" && window.hushifuHost) || null;
+    const host = hostBridge();
+
+    // 虚拟素材地址：https://canvas-assets/<id>
     const canvasAsset = value.match(/^https:\/\/canvas-assets\/([^/?#]+)/i);
-    if (canvasAsset && host && typeof host.materialDataUrl === "function") {
-        try {
-            const dataUrl = await host.materialDataUrl(canvasAsset[1]);
-            if (typeof dataUrl === "string" && dataUrl.startsWith("data:")) return dataUrl;
-        } catch (_error) {
-            // 忽略，走下面报错。
-        }
-        throw new Error("无法从宿主读取该图片素材（canvas-assets 通道失败）");
-    }
+    const storageId = value.startsWith("canvas-storage://")
+        ? value.slice("canvas-storage://".length)
+        : (canvasAsset ? canvasAsset[1] : (storageKey || ""));
 
-    if (value.startsWith("http://") || value.startsWith("https://")) {
-        try {
-            const response = await fetch(value, { cache: "no-store" });
-            if (!response.ok) throw new Error(`HTTP ${response.status}`);
-            const blob = await response.blob();
-            if (blob.type.includes("json") || blob.type.startsWith("text/")) throw new Error("远程地址返回的不是图片");
-            return URL.createObjectURL(blob);
-        } catch (error) {
-            throw new Error(`图片下载失败：${error instanceof Error ? error.message : String(error)}`);
+    if (storageId && host) {
+        for (const method of ["materialDataUrl", "resolveImageUrl", "getImageUrl", "getMaterialUrl"]) {
+            if (typeof host[method] !== "function") continue;
+            try {
+                const result = await host[method](storageId, value);
+                if (typeof result === "string" && result && result !== value) return result;
+            } catch (_error) { /* 试下一个通道 */ }
         }
     }
+    if (canvasAsset) {
+        // 宿主不给通道时，最后仍试原地址（有些版本是代理路由）。
+        // 不直接抛错，避免一张失败拖垮整批。
+    }
 
+    if (/^https?:\/\//i.test(value)) {
+        try {
+            const response = await fetch(value, { cache: "no-store", mode: "cors" });
+            if (response.ok) {
+                const blob = await response.blob();
+                if (blob.type && !blob.type.includes("json") && !blob.type.startsWith("text/")) {
+                    return URL.createObjectURL(blob);
+                }
+            }
+        } catch (_error) { /* 跨域被拦：退回原地址，交给 <img> */ }
+        return value;
+    }
     return value;
 }
 
 // 加载图片，返回 { image, width, height }。
-function loadImage(src) {
+// crossOrigin 尝试 anonymous，能让部分允许 CORS 的外链保留 canvas 可导出性。
+function loadImage(src, withCors = false) {
     return new Promise((resolve, reject) => {
         const image = new Image();
+        if (withCors && /^https?:\/\//i.test(src)) image.crossOrigin = "anonymous";
         image.onload = () => resolve({ image, width: image.naturalWidth, height: image.naturalHeight });
         image.onerror = () => reject(new Error("图片加载失败"));
         image.src = src;
     });
 }
 
-// 判断上游节点是否携带可用图片数据。
-function extractImageSource(node) {
-    if (!node) return null;
-    const isImageType = node.type === "image" || node.type === "panorama";
-    const content = node.metadata?.content;
-    if (!isImageType || typeof content !== "string" || !content) return null;
-    return { id: node.id, src: content, name: node.title || "画布图片" };
+// 先试 CORS 加载，失败再退普通加载（外链最常见的兼容路径）。
+async function loadImageRobust(src) {
+    try { return await loadImage(src, true); }
+    catch (_error) { return loadImage(src, false); }
 }
 
-function buildImageSources(ctx) {
-    const upstream = ctx.getUpstream();
-    return upstream.map(extractImageSource).filter(Boolean);
+// 跨域外链图片会让 <canvas> 被污染，toDataURL 抛 SecurityError。
+// 给出可执行的建议，而不是抛一句看不懂的英文。
+function explainCanvasError(error) {
+    const msg = error instanceof Error ? error.message : String(error);
+    if (/tainted|securityerror|cross-origin/i.test(msg)) {
+        return "图片来自跨域外链，浏览器禁止导出被污染的画布。建议：把该图在画布里另存/上传一次（变成同源 blob），或用「导入图片」选本地文件。";
+    }
+    return msg;
 }
 
 // 输出图片原始尺寸。
@@ -128,7 +305,7 @@ async function sendImages(ctx, images) {
 // regions: [{x, y, w, h}]（相对原图像素坐标）
 // ────────────────────────────────────────────────────────────
 async function splitByRegions(src, regions) {
-    const { image, width, height } = await loadImage(src);
+    const { image, width, height } = await loadImageRobust(src);
     return regions.map((region, index) => {
         const x = Math.max(0, Math.round(region.x));
         const y = Math.max(0, Math.round(region.y));
@@ -173,7 +350,7 @@ async function mergeGrid(items, opts) {
     // 先加载所有图片，取统一尺寸（用第一张的尺寸为准，其余等比缩放到同尺寸）。
     const loaded = [];
     for (const item of items) {
-        const { image, width, height } = await loadImage(item.src);
+        const { image, width, height } = await loadImageRobust(item.src);
         loaded.push({ image, width, height, caption: item.caption || "" });
     }
     if (!loaded.length) throw new Error("没有可合并的图片");
@@ -269,6 +446,91 @@ async function mergeGrid(items, opts) {
     return canvas.toDataURL("image/png");
 }
 
+// ────────────────────────────────────────────────────────────
+// 标注 / 涂鸦引擎
+// 所有几何量都用 0..1 归一化坐标，导出时乘以原图宽高，
+// 因此编辑器里的缩放不会导致线条偏移或粗细失真。
+// shape: { kind:"pen", color, width, points:[{x,y}] }
+//      | { kind:"arrow"|"rect", color, width, from:{x,y}, to:{x,y} }
+// label: { x, y, text, color, fontSize, bg }
+// ────────────────────────────────────────────────────────────
+function arrowHead(g, fromX, fromY, toX, toY, size) {
+    const angle = Math.atan2(toY - fromY, toX - fromX);
+    g.beginPath();
+    g.moveTo(toX, toY);
+    g.lineTo(toX - size * Math.cos(angle - Math.PI / 6), toY - size * Math.sin(angle - Math.PI / 6));
+    g.lineTo(toX - size * Math.cos(angle + Math.PI / 6), toY - size * Math.sin(angle + Math.PI / 6));
+    g.closePath();
+    g.fill();
+}
+
+function paintAnnotations(g, w, h, shapes, labels, draft) {
+    const allShapes = draft ? [...shapes, draft] : shapes;
+    for (const shape of allShapes) {
+        if (!shape) continue;
+        const lw = Math.max(1, (shape.width || 0.004) * w);
+        g.save();
+        g.strokeStyle = shape.color || "#ff3b30";
+        g.fillStyle = shape.color || "#ff3b30";
+        g.lineWidth = lw;
+        g.lineCap = "round";
+        g.lineJoin = "round";
+        if (shape.kind === "pen" && shape.points?.length) {
+            g.beginPath();
+            shape.points.forEach((p, i) => {
+                const px = p.x * w, py = p.y * h;
+                if (i === 0) g.moveTo(px, py); else g.lineTo(px, py);
+            });
+            if (shape.points.length === 1) {
+                g.lineTo(shape.points[0].x * w + 0.1, shape.points[0].y * h);
+            }
+            g.stroke();
+        } else if ((shape.kind === "arrow" || shape.kind === "rect") && shape.from && shape.to) {
+            const x1 = shape.from.x * w, y1 = shape.from.y * h;
+            const x2 = shape.to.x * w, y2 = shape.to.y * h;
+            if (shape.kind === "rect") {
+                g.strokeRect(Math.min(x1, x2), Math.min(y1, y2), Math.abs(x2 - x1), Math.abs(y2 - y1));
+            } else {
+                g.beginPath(); g.moveTo(x1, y1); g.lineTo(x2, y2); g.stroke();
+                arrowHead(g, x1, y1, x2, y2, Math.max(10, lw * 3.5));
+            }
+        }
+        g.restore();
+    }
+
+    for (const label of labels) {
+        const fs = Math.max(8, (label.fontSize || 0.03) * w);
+        const lines = String(label.text || "").split("\n");
+        g.save();
+        g.font = `600 ${fs}px system-ui, sans-serif`;
+        g.textBaseline = "top";
+        const lineH = fs * 1.3;
+        let maxW = 0;
+        for (const line of lines) maxW = Math.max(maxW, g.measureText(line).width);
+        const padX = fs * 0.35, padY = fs * 0.22;
+        const bx = label.x * w, by = label.y * h;
+        if (label.bg !== false) {
+            g.fillStyle = "rgba(0,0,0,0.62)";
+            g.fillRect(bx - padX, by - padY, maxW + padX * 2, lines.length * lineH + padY * 2);
+        }
+        g.fillStyle = label.color || "#ff3b30";
+        lines.forEach((line, i) => g.fillText(line, bx, by + i * lineH));
+        g.restore();
+    }
+}
+
+// 生成最终 PNG（原图分辨率，不压缩）。
+async function renderAnnotated(src, shapes, labels) {
+    const { image, width, height } = await loadImageRobust(src);
+    const canvas = document.createElement("canvas");
+    canvas.width = width;
+    canvas.height = height;
+    const g = canvas.getContext("2d");
+    g.drawImage(image, 0, 0, width, height);
+    paintAnnotations(g, width, height, shapes, labels, null);
+    return canvas.toDataURL("image/png");
+}
+
 function ImageSplitMergeContent({ ctx, React }) {
     const h = React.createElement;
 
@@ -301,47 +563,93 @@ function ImageSplitMergeContent({ ctx, React }) {
     const [busy, setBusy] = React.useState(false);
     const [status, setStatus] = React.useState("");
 
+    // 上游诊断 + 手动重扫
+    const [upstreamInfo, setUpstreamInfo] = React.useState({ total: 0, ok: 0, details: [] });
+    const [showDiagnostics, setShowDiagnostics] = React.useState(false);
+    const [scanTick, setScanTick] = React.useState(0);
+
+    // 标注 / 涂鸦
+    const [editorOpen, setEditorOpen] = React.useState(false);
+    const [strokes, setStrokes] = React.useState([]);      // [{ color, width, points:[{x,y}] }] 归一化 0..1
+    const [labels, setLabels] = React.useState([]);        // [{ x, y, text, color, fontSize, bg }] 归一化 0..1
+    const [annotTool, setAnnotTool] = React.useState("pen"); // pen | eraser | text | arrow | rect
+    const [annotColor, setAnnotColor] = React.useState("#ff3b30");
+    const [annotWidth, setAnnotWidth] = React.useState(4);
+    const [annotFontSize, setAnnotFontSize] = React.useState(24);
+    const [annotTextBg, setAnnotTextBg] = React.useState(true);
+    const [annotPreview, setAnnotPreview] = React.useState(null);
+    const [annotSourceKey, setAnnotSourceKey] = React.useState(null); // null = 跟随第一张上游图
+    const [pendingLabel, setPendingLabel] = React.useState(null); // 待输入文字的位置
+    const [labelDraft, setLabelDraft] = React.useState("");
+    const annotateCanvasRef = React.useRef(null);   // 指向原生编辑器里的 <canvas>
+    const annotateDrawingRef = React.useRef(null);
+    const annotateImageRef = React.useRef(null);
+    const editorApiRef = React.useRef(null);        // 原生浮层句柄
+    const annotStateRef = React.useRef(null);       // 把最新 state 递给原生事件
+    const liveRef = React.useRef(null);             // 把最新回调递给原生事件
+
     const ctxRef = React.useRef(ctx);
     ctxRef.current = ctx;
     const fileInputRef = React.useRef(null);
     const canvasRef = React.useRef(null);
     const drawingRef = React.useRef(null); // 拖拽中 { startX, startY } 相对图片坐标
 
-    // 从上游自动识别图片源：第一张作为「拆分」源图，全部进入「合并」列表。
+    // 上游签名包含地址内容，豆包重新生成后地址变了就会自动重扫（旧版只比 id，不会刷新）。
+    const upstreamSignature = JSON.stringify(
+        buildImageSources(ctxRef.current).map((s) => `${s.id}|${s.src.length}|${s.src.slice(0, 140)}`),
+    );
+
+    // 从上游自动识别图片源：第一张作为「拆分 / 标注」源图，全部进入「合并」列表。
     React.useEffect(() => {
         const sources = buildImageSources(ctxRef.current);
-        if (!sources.length) return;
-        const first = sources[0];
+        if (!sources.length) {
+            setUpstreamInfo({ total: 0, ok: 0, details: [] });
+            return undefined;
+        }
+        let cancelled = false;
         void (async () => {
-            try {
-                // 解析所有上游图片。
-                const resolvedItems = [];
-                for (const s of sources) {
-                    const resolved = await resolveImageSource(s.src);
-                    if (!resolved) continue;
-                    const { width, height } = await loadImage(resolved);
-                    resolvedItems.push({ key: `up-${s.id}`, src: s.src, resolvedSrc: resolved, caption: "", name: s.name, width, height });
+            const resolvedItems = [];
+            const details = [];
+            // 逐张容错：一张豆包外链加载失败，不能让整批图片全部消失。
+            for (const s of sources) {
+                try {
+                    const resolved = await resolveImageSource(s.src, s.storageKey);
+                    if (!resolved) throw new Error("地址为空");
+                    const { width, height } = await loadImageRobust(resolved);
+                    resolvedItems.push({
+                        key: `up-${s.id}`, src: s.src, resolvedSrc: resolved, caption: "",
+                        name: s.name, width, height,
+                    });
+                    details.push({ ok: true, name: s.name, type: s.nodeType, from: s.sourceLabel, src: s.src });
+                } catch (error) {
+                    details.push({
+                        ok: false, name: s.name, type: s.nodeType, from: s.sourceLabel, src: s.src,
+                        error: error instanceof Error ? error.message : String(error),
+                    });
                 }
-                // 合并列表 = 上游图片（替换旧的上游项，保留本地导入项）。
+            }
+            if (cancelled) return;
+            setUpstreamInfo({ total: sources.length, ok: resolvedItems.length, details });
+
+            if (resolvedItems.length) {
+                // 合并列表 = 识别成功的上游图（替换旧上游项，保留本地导入项）。
                 setMergeItems((prev) => {
                     const localItems = prev.filter((it) => it.key.startsWith("local-"));
                     return [...resolvedItems, ...localItems];
                 });
-
-                // 拆分源图用第一张上游。
                 const f = resolvedItems[0];
-                if (f) {
-                    setImageSrc(f.src);
-                    setResolvedSrc(f.resolvedSrc);
-                    setImageName(f.name);
-                    setImgMeta({ width: f.width, height: f.height });
-                }
+                setImageSrc(f.src);
+                setResolvedSrc(f.resolvedSrc);
+                setImageName(f.name);
+                setImgMeta({ width: f.width, height: f.height });
+                annotateImageRef.current = null; // 源图变了，标注层缓存失效
                 setStatus("");
-            } catch (error) {
-                setStatus(`图片加载失败：${error instanceof Error ? error.message : String(error)}`);
+            } else {
+                setStatus(`已找到 ${sources.length} 个上游图片地址，但都无法加载（点「上游诊断」查看原因）`);
             }
         })();
-    }, [JSON.stringify(buildImageSources(ctxRef.current).map((s) => s.id))]);
+        return () => { cancelled = true; };
+    }, [upstreamSignature, scanTick]);
 
     const handleFile = (event) => {
         const file = event.target?.files?.[0];
@@ -400,7 +708,7 @@ function ImageSplitMergeContent({ ctx, React }) {
             setSplitPreviews(results.map((r, i) => ({ key: randomId("split"), dataUrl: r.dataUrl, fileName: `${(imageName.replace(/\.[^.]+$/, "") || "切片")}-${i + 1}.png` })));
             setMergePreview(null);
         } catch (error) {
-            setStatus(`拆分失败：${error instanceof Error ? error.message : String(error)}`);
+            setStatus(`拆分失败：${explainCanvasError(error)}`);
         } finally {
             setBusy(false);
         }
@@ -428,7 +736,7 @@ function ImageSplitMergeContent({ ctx, React }) {
             setMergePreview({ key: randomId("merge"), dataUrl, fileName: "拼接图.png" });
             setSplitPreviews([]);
         } catch (error) {
-            setStatus(`合并失败：${error instanceof Error ? error.message : String(error)}`);
+            setStatus(`合并失败：${explainCanvasError(error)}`);
         } finally {
             setBusy(false);
         }
@@ -457,6 +765,193 @@ function ImageSplitMergeContent({ ctx, React }) {
             setStatus("已回传拼接图到画布");
         } catch (error) {
             setStatus(`回传失败：${error instanceof Error ? error.message : String(error)}`);
+        } finally {
+            setBusy(false);
+        }
+    };
+
+    // ────────────────────────────────────────────────
+    // 标注 / 涂鸦编辑器
+    // ────────────────────────────────────────────────
+    const annotSource = mergeItems.find((it) => it.key === annotSourceKey)
+        || mergeItems[0]
+        || (resolvedSrc ? { key: "__current", resolvedSrc, name: imageName || "当前图片" } : null);
+
+    const redrawAnnotate = () => {
+        const cv = annotateCanvasRef.current;
+        if (!cv) return;
+        const g = cv.getContext("2d");
+        g.clearRect(0, 0, cv.width, cv.height);
+        const img = annotateImageRef.current;
+        if (img) g.drawImage(img, 0, 0, cv.width, cv.height);
+        paintAnnotations(g, cv.width, cv.height, strokes, labels, annotateDrawingRef.current?.draft || null);
+    };
+
+    // 打开编辑器时挂原生浮层到 document.body，绕开宿主画布的 transform。
+    // 原生事件通过 liveRef / annotStateRef 取最新状态，不会拿到创建时的过期闭包。
+    React.useEffect(() => {
+        if (!editorOpen) return undefined;
+        const api = {
+            getState: () => annotStateRef.current,
+            accent: ctx.theme?.accent || "#4c8dff",
+            actions: {
+                setAnnotTool, setAnnotColor, setAnnotWidth, setAnnotFontSize, setAnnotTextBg,
+                setLabelDraft, setPendingLabel, clearAnnot,
+                undoAnnot: () => liveRef.current?.undoAnnot(),
+                buildAnnotated: () => liveRef.current?.buildAnnotated(),
+                addLabel: () => liveRef.current?.addLabel(),
+                closeEditor: () => setEditorOpen(false),
+            },
+            redraw: () => liveRef.current?.redrawAnnotate(),
+            setImageRef: (image) => { annotateImageRef.current = image; },
+            onPointerDown: (e) => liveRef.current?.annotPointerDown(e),
+            onPointerMove: (e) => liveRef.current?.annotPointerMove(e),
+            onPointerUp: (e) => liveRef.current?.annotPointerUp(e),
+        };
+        const editor = openNativeAnnotateEditor(api);
+        editorApiRef.current = editor;
+        annotateCanvasRef.current = editor.canvas;
+        editor.sync();
+        return () => {
+            editor.dispose();
+            editorApiRef.current = null;
+            annotateCanvasRef.current = null;
+        };
+    }, [editorOpen]);
+
+    // 源图变化 / 编辑器刚打开：按原图比例初始化画布。
+    React.useEffect(() => {
+        if (!editorOpen || !annotSource?.resolvedSrc) return undefined;
+        let cancelled = false;
+        void (async () => {
+            try {
+                const { image, width, height } = await loadImageRobust(annotSource.resolvedSrc);
+                if (cancelled || !editorApiRef.current) return;
+                editorApiRef.current.setImage(image, width, height);
+            } catch (error) {
+                setStatus(`标注图片加载失败：${explainCanvasError(error)}`);
+            }
+        })();
+        return () => { cancelled = true; };
+    }, [editorOpen, annotSource?.resolvedSrc]);
+
+    // 状态变化 → 同步工具条 + 重绘画布。
+    React.useEffect(() => {
+        if (editorOpen) editorApiRef.current?.sync();
+    }, [editorOpen, strokes, labels, annotTool, annotColor, annotWidth, annotFontSize, annotTextBg, pendingLabel, labelDraft, busy]);
+
+    const annotPoint = (event) => {
+        const cv = annotateCanvasRef.current;
+        const rect = cv?.getBoundingClientRect();
+        if (!rect) return { x: 0, y: 0 };
+        return {
+            x: Math.min(1, Math.max(0, (event.clientX - rect.left) / Math.max(1, rect.width))),
+            y: Math.min(1, Math.max(0, (event.clientY - rect.top) / Math.max(1, rect.height))),
+        };
+    };
+
+    // 粗细 / 字号都按「当前显示宽度」归一化，保证预览与导出视觉一致。
+    const annotScaleBase = () => {
+        const rect = annotateCanvasRef.current?.getBoundingClientRect();
+        return Math.max(1, rect?.width || 400);
+    };
+
+    const eraseAt = (p) => {
+        const radius = Math.max(8, Number(annotWidth) * 3) / annotScaleBase();
+        setStrokes((prev) => prev.filter((shape) => {
+            const pts = shape.kind === "pen" ? shape.points : [shape.from, shape.to];
+            return !(pts || []).some((q) => q && Math.hypot(q.x - p.x, q.y - p.y) < radius);
+        }));
+        setLabels((prev) => prev.filter((l) => Math.hypot(l.x - p.x, l.y - p.y) > radius * 2));
+    };
+
+    const annotPointerDown = (event) => {
+        event.stopPropagation();
+        const p = annotPoint(event);
+        event.currentTarget.setPointerCapture?.(event.pointerId);
+        if (annotTool === "text") {
+            setPendingLabel(p);
+            setLabelDraft("");
+            return;
+        }
+        if (annotTool === "eraser") {
+            annotateDrawingRef.current = { draft: null, erasing: true };
+            eraseAt(p);
+            return;
+        }
+        const width = Math.max(1, Number(annotWidth) || 4) / annotScaleBase();
+        const base = { kind: annotTool, color: annotColor, width };
+        const draft = annotTool === "pen" ? { ...base, points: [p] } : { ...base, from: p, to: p };
+        annotateDrawingRef.current = { draft, erasing: false };
+        redrawAnnotate();
+    };
+
+    const annotPointerMove = (event) => {
+        event.stopPropagation();
+        const state = annotateDrawingRef.current;
+        if (!state) return;
+        const p = annotPoint(event);
+        if (state.erasing) { eraseAt(p); return; }
+        const d = state.draft;
+        if (!d) return;
+        if (d.kind === "pen") d.points.push(p); else d.to = p;
+        redrawAnnotate();
+    };
+
+    const annotPointerUp = (event) => {
+        event?.stopPropagation?.();
+        const state = annotateDrawingRef.current;
+        if (!state) return;
+        annotateDrawingRef.current = null;
+        const d = state.draft;
+        if (d) {
+            const valid = d.kind === "pen"
+                ? d.points.length > 1
+                : Math.hypot(d.to.x - d.from.x, d.to.y - d.from.y) > 0.004;
+            if (valid) setStrokes((prev) => [...prev, d]);
+        }
+        redrawAnnotate();
+    };
+
+    const addLabel = () => {
+        if (!pendingLabel || !labelDraft.trim()) { setPendingLabel(null); return; }
+        const fontSize = Math.max(10, Number(annotFontSize) || 24) / annotScaleBase();
+        setLabels((prev) => [...prev, {
+            ...pendingLabel, text: labelDraft.trim(), color: annotColor, fontSize, bg: annotTextBg,
+        }]);
+        setPendingLabel(null);
+        setLabelDraft("");
+    };
+
+    const undoAnnot = () => {
+        if (strokes.length) setStrokes((prev) => prev.slice(0, -1));
+        else if (labels.length) setLabels((prev) => prev.slice(0, -1));
+    };
+    const clearAnnot = () => { setStrokes([]); setLabels([]); setAnnotPreview(null); };
+
+    const buildAnnotated = async () => {
+        if (!annotSource?.resolvedSrc) { setStatus("请先导入或连接图片"); return; }
+        setBusy(true);
+        setStatus("");
+        try {
+            const dataUrl = await renderAnnotated(annotSource.resolvedSrc, strokes, labels);
+            const base = String(annotSource.name || "标注图").replace(/\.[^.]+$/, "");
+            setAnnotPreview({ dataUrl, fileName: `${base}-标注.png` });
+        } catch (error) {
+            setStatus(`标注图生成失败：${explainCanvasError(error)}`);
+        } finally {
+            setBusy(false);
+        }
+    };
+
+    const exportAnnotated = async () => {
+        if (!annotPreview) { setStatus("请先生成标注图"); return; }
+        setBusy(true);
+        try {
+            await sendImages(ctxRef.current, [annotPreview]);
+            setStatus("已回传标注图到画布");
+        } catch (error) {
+            setStatus(`回传失败：${explainCanvasError(error)}`);
         } finally {
             setBusy(false);
         }
@@ -576,6 +1071,47 @@ function ImageSplitMergeContent({ ctx, React }) {
             onClick: () => setSplitMode(value),
         }, label);
 
+    const smallButton = (label, onClick) =>
+        h("button", { type: "button", style: { ...buttonStyle, padding: "3px 8px", fontSize: 11 }, onClick }, label);
+
+    const shortSrc = (s) => {
+        const v = String(s || "");
+        if (v.startsWith("data:")) return `data:image/…（${v.length} 字符）`;
+        return v.length > 88 ? `${v.slice(0, 62)}…${v.slice(-14)}` : v;
+    };
+
+    const diagnosticsUI = h("div", { style: { marginTop: 6, borderTop: `1px dashed ${stroke}`, paddingTop: 6 } },
+        h("div", { style: { display: "flex", gap: 6, alignItems: "center", flexWrap: "wrap" } },
+            h("span", { style: { fontSize: 11, color: muted } }, `上游识别：${upstreamInfo.ok}/${upstreamInfo.total} 张可用`),
+            smallButton("重新扫描", () => setScanTick((t) => t + 1)),
+            smallButton(showDiagnostics ? "收起详情" : "上游诊断", () => setShowDiagnostics((v) => !v)),
+        ),
+        showDiagnostics
+            ? h("div", { style: { marginTop: 6, maxHeight: 170, overflowY: "auto", fontSize: 10, lineHeight: 1.6, color: muted, background: ctx.theme.toolbar.panel || "transparent", border: `1px solid ${stroke}`, borderRadius: 6, padding: 6 } },
+                upstreamInfo.details.length
+                    ? upstreamInfo.details.slice(0, 20).map((d, i) =>
+                        h("div", { key: i, style: { marginBottom: 4, wordBreak: "break-all" } },
+                            `${d.ok ? "✅" : "❌"} [${d.from}] type=${d.type} · ${d.name}`,
+                            h("br"),
+                            shortSrc(d.src),
+                            d.error ? ` ｜ ${d.error}` : "",
+                        ),
+                    )
+                    : "未发现上游图片地址。请确认连线方向（上游 → 本节点），或点「重新扫描」。若豆包节点是批量生成，展开的图片子节点也会被自动扫描。",
+            )
+            : null,
+    );
+
+    // 渲染末尾刷新「给原生浮层用」的最新状态与回调（避免闭包过期）。
+    annotStateRef.current = {
+        annotTool, annotColor, annotWidth, annotFontSize, annotTextBg,
+        strokes, labels, pendingLabel, labelDraft, busy,
+    };
+    liveRef.current = {
+        redrawAnnotate, annotPointerDown, annotPointerMove, annotPointerUp,
+        buildAnnotated, undoAnnot, addLabel,
+    };
+
     return h(
         "div",
         { "data-canvas-no-zoom": true, style: { display: "flex", flexDirection: "column", gap: 10, padding: 12, width: "100%", height: "100%", boxSizing: "border-box", overflowY: "auto", color: text, fontSize: 12 } },
@@ -585,12 +1121,40 @@ function ImageSplitMergeContent({ ctx, React }) {
         ),
         // 图片来源
         h("div", null,
-            h("div", { style: labelStyle }, "图片来源"),
+            h("div", { style: labelStyle }, "图片来源（自动适配普通图片 / 豆包生图 / 批量生成节点）"),
             h("input", { ref: fileInputRef, type: "file", accept: "image/*", style: { display: "none" }, onChange: handleFile }),
             h("div", { style: { display: "flex", gap: 6, alignItems: "center" } },
                 h("button", { type: "button", style: buttonStyle, onClick: () => fileInputRef.current?.click() }, "导入图片"),
                 resolvedSrc ? h("span", { style: { fontSize: 11, color: muted, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" } }, `${imageName || "已加载"} ${imgMeta.width}×${imgMeta.height}`) : h("span", { style: { fontSize: 11, color: muted } }, "也可连接上游图片节点"),
             ),
+            diagnosticsUI,
+        ),
+        // ── 标注 / 涂鸦 ──
+        h("div", { style: { borderTop: `1px solid ${stroke}`, paddingTop: 10 } },
+            h("div", { style: { fontSize: 13, fontWeight: 600, marginBottom: 6 } }, "🎨 文字标注 / 涂鸦"),
+            h("div", { style: labelStyle }, "选择要标注的图片"),
+            h("select", {
+                value: annotSource?.key || "",
+                style: inputStyle,
+                onChange: (e) => setAnnotSourceKey(e.target.value || null),
+            },
+                mergeItems.length
+                    ? mergeItems.map((it, i) => h("option", { key: it.key, value: it.key }, `${i + 1}. ${it.name}`))
+                    : resolvedSrc
+                        ? h("option", { value: "__current" }, `当前图片 · ${imageName || "已加载"}`)
+                        : h("option", { value: "" }, "（暂无图片，请先连接上游或导入）"),
+            ),
+            h("div", { style: { display: "flex", gap: 6, marginTop: 6, flexWrap: "wrap" } },
+                h("button", { type: "button", style: primaryStyle, onClick: () => setEditorOpen(true), disabled: !annotSource?.resolvedSrc }, "打开标注编辑器"),
+                h("span", { style: { fontSize: 11, color: muted, alignSelf: "center" } }, `${strokes.length} 笔 · ${labels.length} 处文字`),
+                (strokes.length || labels.length) ? smallButton("清空标注", clearAnnot) : null,
+            ),
+            annotPreview
+                ? h("div", { style: { marginTop: 8 } },
+                    h("img", { src: annotPreview.dataUrl, alt: "标注结果", style: { width: "100%", maxHeight: 220, objectFit: "contain", borderRadius: 8, display: "block", background: "#000" } }),
+                    h("button", { type: "button", style: { ...primaryStyle, marginTop: 6 }, onClick: exportAnnotated, disabled: busy }, "回传标注图到画布"),
+                )
+                : null,
         ),
         // ── 拆分 ──
         h("div", { style: { fontSize: 13, fontWeight: 600, marginTop: 4 } }, "拆分（切割）"),
@@ -720,25 +1284,28 @@ function ImageSplitMergeContent({ ctx, React }) {
                 h("button", { type: "button", style: { ...primaryStyle, marginTop: 8 }, onClick: exportMerge, disabled: busy }, "回传拼接图到画布"),
             )
             : null,
-        status ? h("div", { style: { color: "#ef9a9a", fontSize: 11 } }, status) : null,
+        status ? h("div", { style: { color: "#ef9a9a", fontSize: 11, whiteSpace: "pre-wrap" } }, status) : null,
     );
 }
+
+// 供 test-upstream.mjs 做纯逻辑回归测试；宿主只消费 default export，这些额外导出无副作用。
+export { buildImageSources, extractNodeUrls, looksLikeImageUrl, normalizeUpstream, expandUpstream, paintAnnotations };
 
 export default function createImageSplitMergePlugin(runtime) {
     const React = runtime.React;
     return {
         id: "image-split-merge",
         name: "图片拆分与合并",
-        version: "0.2.0",
+        version: "0.3.0",
         minAppVersion: "0.12.0",
-        description: "把图片拆分成多块（网格均分/自定义图框），或把多张图片拼接成带分割线、图号、批注的网格图。",
+        description: "图片拆分（网格/图框）、合并（拼接+图号+批注）、文字标注与涂鸦画笔；自动适配豆包生图等自定义上游节点。",
         nodes: [
             {
                 type: "image:split-merge",
                 title: "图片拆分与合并",
                 icon: "🧩",
-                description: "拆分图片（网格/图框）与合并图片（拼接+图号+批注）",
-                defaultSize: { width: 380, height: 720 },
+                description: "拆分 / 合并 / 文字标注与涂鸦，支持豆包生图上游节点",
+                defaultSize: { width: 400, height: 820 },
                 defaultMetadata: {},
                 hasSourceHandle: true,
                 hidePanel: true,
